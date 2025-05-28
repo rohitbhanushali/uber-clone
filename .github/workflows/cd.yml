@@ -1,0 +1,111 @@
+name: CD
+
+on:
+  push:
+    branches: [ main, develop ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ steps.login-ecr.outputs.registry }}/uber-clone
+        tags: |
+          type=sha,format=short
+          type=ref,event=branch
+          type=ref,event=tag
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Store current task definition
+      id: store-task
+      run: |
+        TASK_DEF=$(aws ecs describe-task-definition --task-definition uber-clone-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }} --region ${{ secrets.AWS_REGION }} | jq '.taskDefinition')
+        echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+    
+    - name: Update ECS service
+      id: deploy
+      run: |
+        aws ecs update-service --cluster uber-clone-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }} \
+          --service uber-clone-service \
+          --force-new-deployment \
+          --region ${{ secrets.AWS_REGION }}
+    
+    - name: Wait for service stability
+      id: wait
+      run: |
+        aws ecs wait services-stable \
+          --cluster uber-clone-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }} \
+          --services uber-clone-service \
+          --region ${{ secrets.AWS_REGION }}
+    
+    - name: Health check
+      id: health
+      run: |
+        # Wait for application to be ready
+        for i in {1..30}; do
+          if curl -f ${{ github.ref == 'refs/heads/main' && secrets.PROD_URL || secrets.STAGING_URL }}/api/health; then
+            echo "Application is healthy"
+            exit 0
+          fi
+          echo "Waiting for application to be healthy... ($i/30)"
+          sleep 10
+        done
+        echo "Health check failed"
+        exit 1
+    
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, rolling back..."
+        aws ecs update-service --cluster uber-clone-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }} \
+          --service uber-clone-service \
+          --task-definition ${{ steps.store-task.outputs.task_def }} \
+          --region ${{ secrets.AWS_REGION }}
+        
+        aws ecs wait services-stable \
+          --cluster uber-clone-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }} \
+          --services uber-clone-service \
+          --region ${{ secrets.AWS_REGION }}
+    
+    - name: Notify deployment status
+      if: always()
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        channel-id: 'deployments'
+        slack-message: |
+          Deployment to ${{ github.ref == 'refs/heads/main' && 'Production' || 'Staging' }} ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          Branch: ${{ github.ref_name }}
+          ${{ steps.health.outcome == 'failure' && '❌ Health check failed' || '✅ Health check passed' }}
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }} 

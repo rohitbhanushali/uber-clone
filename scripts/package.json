@@ -1,0 +1,14 @@
+{
+  "name": "uber-clone-scripts",
+  "version": "1.0.0",
+  "description": "Deployment scripts for Uber Clone",
+  "scripts": {
+    "validate": "node validate-env.js",
+    "init-db": "node init-db.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "sequelize": "^6.37.1",
+    "pg": "^8.11.3"
+  }
+} 
